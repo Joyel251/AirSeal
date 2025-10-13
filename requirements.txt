@@ -1,0 +1,30 @@
+# AirSeal Dependencies
+# For pip-based installs (alternative to Poetry)
+
+# GUI Framework
+PySide6>=6.8.0
+
+# Cryptography
+cryptography>=42.0.0
+
+# QR Code generation and parsing
+qrcode[pil]>=7.4.0
+Pillow>=10.0.0
+pyzbar>=0.1.9
+
+# Optional: Video capture for camera scanning
+opencv-python>=4.10.0
+
+# Optional: Advanced features
+cbor2>=5.6.0
+pydantic>=2.10.0
+
+# CLI and utilities
+typer>=0.15.0
+rich>=13.9.0
+
+# Dev dependencies
+pytest>=8.3.0
+mypy>=1.13.0
+ruff>=0.8.0
+pyinstaller>=6.11.0
