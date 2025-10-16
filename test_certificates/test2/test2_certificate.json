@@ -1,0 +1,26 @@
+{
+  "version": "1.1",
+  "revoked": false,
+  "serial_number": "cf652e81666f94696351077673a6f458",
+  "subject": {
+    "operator_name": "test",
+    "station_id": "123nnn",
+    "organization": "hos",
+    "department": "cse",
+    "email": null,
+    "permissions": []
+  },
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEASeP6RkUHYZ0Zbs6LgHA9j7p7puTEUKxmd8qpuupz53U=\n-----END PUBLIC KEY-----\n",
+  "public_key_fingerprint": "dc849e417d27827a",
+  "issuer": {
+    "common_name": "AirSeal Test Root CA",
+    "fingerprint": "7fe6522923438e3d"
+  },
+  "issuer_name": "AirSeal Test Root CA",
+  "issuer_fingerprint": "7fe6522923438e3d",
+  "not_before": 1760560555.8332305,
+  "not_after": 1763670955.8332305,
+  "valid_from": "2025-10-15T20:35:55.833230Z",
+  "valid_until": "2025-11-20T20:35:55.833230Z",
+  "signature": "e37a031d58f7b0e744468a12a0ee2c4ab2b85333c975f0dde180f13be1ec3b53ae00996392b49e009bf61c6a54e6c53d490c6bad47b2096f8937fa9cf3c9780c"
+}

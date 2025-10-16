@@ -183,15 +183,34 @@ class PolicyEngine:
 DEFAULT_POLICY = SecurityPolicy(
     policy_id="default-v1",
     name="Default Security Policy",
-    description="Standard security policy for general use",
-    allowed_extensions=[".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".jpg", ".png"],
-    blocked_extensions=[".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".scr"],
-    max_file_size_mb=100,
+    description="Standard security policy for general use - allows all common file types",
+    allowed_extensions=[
+        # Documents
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf", ".odt", ".ods", ".odp",
+        # Images
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico", ".tif", ".tiff", ".heic",
+        # Videos
+        ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp", ".ogv",
+        # Audio
+        ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus", ".ape", ".alac",
+        # Archives
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso", ".dmg",
+        # Executables & Installers
+        ".exe", ".msi", ".bat", ".cmd", ".sh", ".app", ".deb", ".rpm", ".apk",
+        # Scripts & Code
+        ".ps1", ".vbs", ".js", ".py", ".java", ".c", ".cpp", ".h", ".cs", ".go", ".rs", ".rb", ".php",
+        # Data & Config
+        ".json", ".xml", ".yaml", ".yml", ".csv", ".sql", ".db", ".sqlite", ".ini", ".cfg", ".conf",
+        # Other
+        ".dll", ".so", ".dylib", ".jar", ".war", ".ear", ".class",
+    ],
+    blocked_extensions=[],  # No blocked extensions
+    max_file_size_mb=500,  # Support large video files
     require_clean_scan=True,
     allowed_scan_engines=["Windows Defender", "ClamAV", "Demo Scanner"],
     allowed_signers=[],  # Empty = any trusted signer
     max_manifest_age_hours=24,
-    allow_archives=False,
+    allow_archives=True,
     require_signature=True,
 )
 

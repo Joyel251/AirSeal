@@ -1,0 +1,6 @@
+{
+  "name": "AirSeal Test Root CA",
+  "fingerprint": "7fe6522923438e3d",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAnGGP3pjHmXw7GwqVPKDP0V1wx/XY3iCTuRJrESprXjE=\n-----END PUBLIC KEY-----\n",
+  "type": "root_ca"
+}

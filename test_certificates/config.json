@@ -1,0 +1,10 @@
+{
+  "ca_certificate": "C:\\Users\\aarinlourdu\\Music\\airseal\\test_certificates\\ca_certificate.json",
+  "sender_certificate": "C:\\Users\\aarinlourdu\\Music\\airseal\\test_certificates\\sender_certificate.json",
+  "sender_private_key": "C:\\Users\\aarinlourdu\\Music\\airseal\\test_certificates\\sender_private_key.pem",
+  "instructions": [
+    "Sender will load certificate from test_certificates/sender_certificate.json",
+    "Receiver will load CA certificate from test_certificates/ca_certificate.json",
+    "These paths are configured in the GUI code"
+  ]
+}

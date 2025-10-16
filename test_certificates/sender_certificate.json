@@ -1,0 +1,24 @@
+{
+  "version": "1.0",
+  "serial_number": "cc22283384abccb6eb7286d9b3fb4b0c",
+  "subject": {
+    "operator_name": "Dr. Sarah Johnson",
+    "station_id": "Medical-Scan-01",
+    "organization": "City Hospital",
+    "department": "IT Security",
+    "email": "sjohnson@hospital.org",
+    "permissions": [
+      "medical_systems",
+      "patient_records"
+    ]
+  },
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAptzhw0vd0UvMXOYRD7Qoxv76rsaqqEtPgvay/ozLL3E=\n-----END PUBLIC KEY-----\n",
+  "public_key_fingerprint": "0a7ccabc11d5d5a3",
+  "issuer_name": "AirSeal Test Root CA",
+  "issuer_fingerprint": "7fe6522923438e3d",
+  "not_before": 1760553486.362432,
+  "not_after": 1792089486.362432,
+  "revoked": false,
+  "revocation_reason": null,
+  "signature": "2da634c72bca5a66a0e1b55df0ff509d1c28970bac9d6dc493c426fd3af8e7628315e797b6883aa9aec1a54d1d080b79b688feb4a7d01e6a23c35656541ec70f"
+}

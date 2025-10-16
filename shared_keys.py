@@ -1,6 +1,9 @@
 """Shared key storage for testing - allows sender and receiver to trust each other."""
 
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Optional
 import json
 from airseal_common import KeyPair
 
@@ -12,8 +15,32 @@ SENDER_KEY_FILE = KEYS_DIR / "sender_key.json"
 RECEIVER_KEY_FILE = KEYS_DIR / "receiver_key.json"
 
 
-def get_or_create_sender_key() -> KeyPair:
-    """Get existing sender key or create new one."""
+def get_or_create_sender_key(username: Optional[str] = None) -> KeyPair:
+    """Get existing sender key or create new one.
+
+    Prefers keys associated with the logged-in operator's certificate when available.
+    """
+    # Check for certificate-based key first
+    candidate_key_paths: list[Path] = []
+
+    if username:
+        candidate_key_paths.append(Path(__file__).parent / "test_certificates" / username / f"{username}_private_key.pem")
+        candidate_key_paths.append(Path("C:/ProgramData/AirSeal/certificates") / f"{username}_private_key.pem")
+
+    candidate_key_paths.append(Path(__file__).parent / "test_certificates" / "sender_private_key.pem")
+    candidate_key_paths.append(Path("C:/ProgramData/AirSeal/certificates") / "sender_private_key.pem")
+
+    cert_key_path: Path | None = next((p for p in candidate_key_paths if p.exists()), None)
+
+    if cert_key_path is not None:
+        from cryptography.hazmat.primitives import serialization
+        private_bytes = cert_key_path.read_bytes()
+        private_key_obj = serialization.load_pem_private_key(private_bytes, password=None)
+        key = KeyPair(private_key=private_key_obj)
+        print(f"✓ Loaded sender key from certificate: {key.get_fingerprint()[:16]}... (source: {cert_key_path})")
+        return key
+    
+    # Fall back to test key storage
     if SENDER_KEY_FILE.exists():
         with open(SENDER_KEY_FILE, 'r') as f:
             data = json.load(f)

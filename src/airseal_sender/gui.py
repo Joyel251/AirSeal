@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTime
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QAction, QTextCursor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -100,12 +101,14 @@ class ScanWorker(QThread):
     progress_value = Signal(int)
     finished = Signal(dict)
 
-    def __init__(self, source: Path, sender_key: KeyPair, nonce: str, transfer_id: str) -> None:
+    def __init__(self, source: Path, sender_key: KeyPair, nonce: str, transfer_id: str, certificate: Optional[dict] = None, user_info: Optional[dict] = None) -> None:
         super().__init__()
         self._source = source
         self._sender_key = sender_key
         self._nonce = nonce
         self._transfer_id = transfer_id
+        self._certificate = certificate
+        self._user_info = user_info
 
     def run(self) -> None:
         """Execute real analysis pipeline with backend."""
@@ -114,7 +117,7 @@ class ScanWorker(QThread):
             self.progress.emit("Computing SHA-256 hash...")
             self.progress_value.emit(20)
             file_hash = compute_file_hash(self._source)
-            self.progress.emit(f"✓ Hash: {file_hash[:16]}...")
+            self.progress.emit(f"[OK] Hash: {file_hash[:16]}...")
             
             # Step 2: Scan file
             self.progress.emit("Scanning file for threats...")
@@ -132,7 +135,7 @@ class ScanWorker(QThread):
                 return
 
             scan_result = scanner.scan(self._source)
-            self.progress.emit(f"✓ Scan: {scan_result.status} ({scan_result.engine})")
+            self.progress.emit(f"[OK] Scan: {scan_result.status} ({scan_result.engine})")
             
             if not scan_result.is_clean():
                 self.finished.emit({
@@ -156,15 +159,22 @@ class ScanWorker(QThread):
                 policy_id="default-v1",
                 nonce=self._nonce,
                 transfer_id=self._transfer_id,
+                sender_certificate=self._certificate,
+                user_info=self._user_info,
             )
-            self.progress.emit("✓ Manifest created")
+            if self._certificate and self._user_info:
+                self.progress.emit(f"[OK] Manifest created (authenticated: {self._user_info.get('full_name', 'Unknown')})")
+            elif self._certificate:
+                self.progress.emit(f"[OK] Manifest created (with certificate)")
+            else:
+                self.progress.emit("[OK] Manifest created")
             
             # Step 4: Sign manifest
             self.progress.emit("Signing with Ed25519...")
             self.progress_value.emit(80)
             signer = ManifestSigner(self._sender_key)
             signed_manifest = signer.sign_manifest(manifest)
-            self.progress.emit(f"✓ Signature: {signed_manifest.signature[:16]}...")
+            self.progress.emit(f"[OK] Signature: {signed_manifest.signature[:16]}...")
             
             # Step 5: Generate QR code
             self.progress.emit("Generating QR code...")
@@ -181,7 +191,7 @@ class ScanWorker(QThread):
             qr_pixmap = QPixmap()
             qr_pixmap.loadFromData(buffer.getvalue())
             
-            self.progress.emit("✓ QR code generated")
+            self.progress.emit("[OK] QR code generated")
             self.progress_value.emit(100)
             
             # Return result
@@ -212,6 +222,14 @@ class SenderMainWindow(QMainWindow):
         else:
             self.setWindowIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
 
+        # User authentication
+        self.logged_in_user = None
+        self._perform_login()
+        
+        if not self.logged_in_user:
+            # Login failed or cancelled - exit
+            sys.exit(0)
+        
         self.selected_file: Optional[Path] = None
         self.manifest: Optional[dict] = None
         self.scan_worker: Optional[ScanWorker] = None
@@ -219,14 +237,22 @@ class SenderMainWindow(QMainWindow):
         
         # Initialize sender key using shared key storage for testing
         from shared_keys import get_or_create_sender_key
-        self.sender_key = get_or_create_sender_key()
+        username = getattr(self.logged_in_user, "username", None)
+        self.sender_key = get_or_create_sender_key(username)
         self.sender_fingerprint = self.sender_key.get_fingerprint()
+        
+        # Load sender certificate (if available)
+        self.certificate_path: Optional[Path] = None
+        self.sender_certificate = self._load_certificate()
         
         # Nonce data (to be scanned from receiver)
         self.nonce: Optional[str] = None
         self.transfer_id: Optional[str] = None
 
         self._build_ui()
+        
+        # Update window title with logged-in user
+        self.setWindowTitle(f"AirSeal Sender - {self.logged_in_user.full_name} ({self.logged_in_user.role.capitalize()})")
 
     def _build_ui(self) -> None:
         """Build main UI with global scroll area and toolbar."""
@@ -254,6 +280,18 @@ class SenderMainWindow(QMainWindow):
         action_about = QAction("About", self)
         action_about.triggered.connect(self._show_about)
         toolbar.addAction(action_about)
+        
+        toolbar.addSeparator()
+        
+        # Admin menu (only for admins)
+        if self.logged_in_user and self.logged_in_user.role == "admin":
+            action_users = QAction("👥 Manage Users", self)
+            action_users.triggered.connect(self._manage_users)
+            toolbar.addAction(action_users)
+            
+            action_gen_cert = QAction("📜 Generate Certificate", self)
+            action_gen_cert.triggered.connect(self._generate_certificate)
+            toolbar.addAction(action_gen_cert)
 
         # Background pane + global scroll
         background = QWidget()
@@ -305,6 +343,42 @@ class SenderMainWindow(QMainWindow):
         subheader = QLabel("Prepare a signed manifest for controlled, air-gapped transfer.")
         subheader.setStyleSheet("color: #94a3b8; font-size: 15px; letter-spacing: 0.3px;")
         container_layout.addWidget(subheader)
+        
+        # User info panel
+        user_info_frame = QFrame()
+        user_info_frame.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(34, 211, 238, 0.15), stop:1 rgba(14, 165, 233, 0.15));
+                border: 1px solid rgba(34, 211, 238, 0.3);
+                border-radius: 12px;
+                padding: 12px;
+            }
+        """)
+        user_info_layout = QHBoxLayout(user_info_frame)
+        user_info_layout.setSpacing(15)
+        
+        user_icon = QLabel("[USER]")
+        user_icon.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        user_icon.setStyleSheet("color: #22d3ee;")
+        user_info_layout.addWidget(user_icon)
+        
+        user_details = QLabel(
+            f"<b>{self.logged_in_user.full_name}</b><br>"
+            f"<span style='color: #22d3ee;'>{self.logged_in_user.role.upper()}</span> • "
+            f"{self.logged_in_user.username}"
+        )
+        user_details.setStyleSheet("color: #f8fafc; font-size: 13px;")
+        user_info_layout.addWidget(user_details)
+        
+        if self.logged_in_user.station_id:
+            station_label = QLabel(f"Station: {self.logged_in_user.station_id}")
+            station_label.setStyleSheet("color: #94a3b8; font-size: 12px;")
+            user_info_layout.addWidget(station_label)
+        
+        user_info_layout.addStretch()
+        
+        container_layout.addWidget(user_info_frame)
 
         # Cards
         self.file_card = self._create_card(
@@ -621,6 +695,22 @@ class SenderMainWindow(QMainWindow):
             QMessageBox.warning(self, "No file", "Select a source file first.")
             return
         
+        # SECURITY CHECK: Validate sender identity and certificate before transfer
+        validation_result = self._validate_sender_identity()
+        if not validation_result["valid"]:
+            QMessageBox.critical(
+                self,
+                "Transfer Blocked",
+                f"Cannot proceed with transfer:\n\n{validation_result['error']}\n\n"
+                f"Please contact your administrator to resolve this issue."
+            )
+            return
+        
+        # Show identity confirmation dialog
+        if not self._confirm_sender_identity(validation_result):
+            self.statusBar().showMessage("Transfer cancelled by user", 3000)
+            return
+        
         # Generate nonce for this transfer
         if not self.nonce:
             import secrets
@@ -631,7 +721,17 @@ class SenderMainWindow(QMainWindow):
         self.log_view.clear()
         self.progress_bar.setValue(0)
 
-        worker = ScanWorker(self.selected_file, self.sender_key, self.nonce, self.transfer_id)
+        # Prepare user info for manifest
+        user_info = {
+            "username": self.logged_in_user.username,
+            "full_name": self.logged_in_user.full_name,
+            "role": self.logged_in_user.role,
+            "station_id": self.logged_in_user.station_id,
+            "organization": self.logged_in_user.organization,
+            "department": self.logged_in_user.department,
+        } if self.logged_in_user else None
+
+        worker = ScanWorker(self.selected_file, self.sender_key, self.nonce, self.transfer_id, self.sender_certificate, user_info)
         worker.progress.connect(self._append_log)
         worker.progress_value.connect(self.progress_bar.setValue)
         worker.finished.connect(self._scan_complete)
@@ -653,7 +753,7 @@ class SenderMainWindow(QMainWindow):
             self.qr_pixmap = result.get("qr_pixmap")
             manifest = result["manifest"]
             size_mb = manifest["size"] / (1024 * 1024)
-            self.log_view.append("✓ Analysis pipeline completed successfully.")
+            self.log_view.append("[OK] Analysis pipeline completed successfully.")
             
             # Display QR code
             if self.qr_pixmap:
@@ -713,6 +813,338 @@ class SenderMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Copy failed", f"Could not copy manifest JSON:\n{e}")
 
+    def _perform_login(self):
+        """Perform user login."""
+        from airseal_common.admin_dialogs import LoginDialog
+        
+        login_dialog = LoginDialog(self)
+        if login_dialog.exec() == QDialog.DialogCode.Accepted:
+            self.logged_in_user = login_dialog.authenticated_user
+            print(f"[OK] User logged in: {self.logged_in_user.full_name} ({self.logged_in_user.role})")
+        else:
+            self.logged_in_user = None
+    
+    def _manage_users(self):
+        """Open user management dialog (admin only)."""
+        if self.logged_in_user.role != "admin":
+            QMessageBox.warning(self, "Access Denied", "Only administrators can manage users")
+            return
+        
+        from airseal_common.admin_dialogs import UserManagementDialog
+        dialog = UserManagementDialog(self.logged_in_user, self)
+        dialog.exec()
+    
+    def _generate_certificate(self):
+        """Generate certificate for a user (admin only)."""
+        if self.logged_in_user.role != "admin":
+            QMessageBox.warning(self, "Access Denied", "Only administrators can generate certificates")
+            return
+        
+        from airseal_common.admin_dialogs import CertificateGenerationDialog
+        
+        dialog = CertificateGenerationDialog(self.logged_in_user, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Certificate was generated successfully
+            QMessageBox.information(
+                self,
+                "Success",
+                "Certificate generated successfully!\n\n"
+                "The operator can now use this certificate for secure transfers."
+            )
+    
+    def _validate_sender_identity(self) -> dict:
+        """
+        Validate sender identity and certificate before allowing transfer.
+        
+        Returns dict with:
+        - valid: bool
+        - error: str (if not valid)
+        - certificate_status: str
+        - identity: dict (if certificate available)
+        - signed_by: str (CA name)
+        """
+        result = {
+            "valid": False,
+            "error": None,
+            "certificate_status": "No certificate",
+            "identity": None,
+            "signed_by": None,
+            "expires": None
+        }
+        
+        # Check if user is logged in
+        if not self.logged_in_user:
+            result["error"] = "No user logged in. Please restart the application."
+            return result
+        
+        # Check if certificate exists
+        if not self.sender_certificate:
+            result["certificate_status"] = "WARNING: No certificate (anonymous transfer)"
+            result["valid"] = True  # Allow but warn
+            result["error"] = None
+            return result
+        
+        # Validate certificate
+        try:
+            from airseal_common.certificates import Certificate, CertificateVerifier
+            from pathlib import Path
+            from datetime import datetime
+            
+            cert = Certificate.from_dict(self.sender_certificate)
+            
+            # Load CA certificate for validation
+            ca_path = Path("test_certificates/ca_certificate.json")
+            if not ca_path.exists():
+                result["error"] = "Certificate Authority (CA) certificate not found.\nCannot verify certificate authenticity."
+                return result
+            
+            import json
+            with open(ca_path, 'r', encoding='utf-8') as f:
+                ca_cert_data = json.load(f)
+
+            # Verify certificate
+            verifier = CertificateVerifier(ca_cert_data)
+            is_valid, error_msg = verifier.verify_certificate(cert)
+            
+            if not is_valid:
+                result["error"] = f"Certificate validation failed:\n{error_msg}\n\nTransfer cannot proceed with invalid certificate."
+                return result
+            
+            # Check expiration
+            valid_until = datetime.fromisoformat(cert.valid_until.replace('Z', '+00:00'))
+            now = datetime.now(valid_until.tzinfo)
+            
+            if now > valid_until:
+                result["error"] = f"Certificate has EXPIRED on {valid_until.strftime('%Y-%m-%d')}.\n\nPlease request a new certificate from your administrator."
+                return result
+            
+            days_until_expiry = (valid_until - now).days
+            if days_until_expiry <= 30:
+                result["certificate_status"] = f"WARNING: Certificate expires in {days_until_expiry} days"
+            else:
+                result["certificate_status"] = "Valid"
+            
+            # Extract identity
+            result["identity"] = verifier.extract_identity(cert)
+            issuer_info = cert.issuer or {}
+            result["signed_by"] = issuer_info.get("common_name", cert.issuer_name or "Unknown CA")
+            result["issuer_fingerprint"] = issuer_info.get("fingerprint") or cert.issuer_fingerprint
+            result["serial"] = cert.serial_number
+            result["valid_from"] = cert.valid_from
+            result["expires"] = valid_until.strftime("%Y-%m-%d %H:%M:%S")
+            result["valid"] = True
+            
+        except Exception as e:
+            result["error"] = f"Certificate validation error:\n{str(e)}\n\nPlease contact your administrator."
+            return result
+        
+        return result
+    
+    def _confirm_sender_identity(self, validation_result: dict) -> bool:
+        """
+        Show confirmation dialog with sender identity before transfer.
+        Returns True if user confirms, False if cancelled.
+        """
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QDialogButtonBox
+        from PySide6.QtGui import QFont
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Confirm Sender Identity")
+        dialog.setMinimumWidth(600)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(20)
+        layout.setContentsMargins(30, 30, 30, 30)
+        
+        # Title
+        title = QLabel("CONFIRM SENDER IDENTITY BEFORE TRANSFER")
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        title.setStyleSheet("color: #22d3ee;")
+        layout.addWidget(title)
+        
+        # Warning if no certificate
+        if not validation_result.get("identity"):
+            warning = QLabel(
+                "[WARNING] No certificate attached to this transfer.\n"
+                "The receiver will only see your cryptographic key fingerprint.\n\n"
+                "Consider requesting a certificate from your administrator for verified identity."
+            )
+            warning.setWordWrap(True)
+            warning.setStyleSheet("""
+                background: rgba(234, 179, 8, 0.1);
+                border: 2px solid rgba(234, 179, 8, 0.5);
+                border-radius: 8px;
+                padding: 15px;
+                color: #fbbf24;
+                font-size: 12px;
+            """)
+            layout.addWidget(warning)
+        
+        # Logged-in user info
+        user_section = QLabel(
+            "<b>SENDER (Logged-In User):</b><br>"
+            f"  Name: {self.logged_in_user.full_name}<br>"
+            f"  Username: {self.logged_in_user.username}<br>"
+            f"  Role: {self.logged_in_user.role.upper()}<br>"
+            f"  Station: {self.logged_in_user.station_id or 'Not specified'}<br>"
+            f"  Organization: {self.logged_in_user.organization or 'Not specified'}"
+        )
+        user_section.setWordWrap(True)
+        user_section.setStyleSheet("background: rgba(15, 23, 42, 0.6); padding: 15px; border-radius: 8px; font-size: 13px; color: #e2e8f0;")
+        layout.addWidget(user_section)
+        
+        # Certificate info (if available)
+        if validation_result.get("identity"):
+            identity = validation_result["identity"]
+            
+            cert_lines = [
+                "<b>CERTIFICATE (Verified Identity):</b>",
+                f"  Operator: {identity.get('operator_name', 'Unknown')}",
+                f"  Organization: {identity.get('organization', 'Unknown')}",
+                f"  Station: {identity.get('station_id', 'Unknown')}",
+                f"  Department: {identity.get('department', 'Not specified')}",
+                f"  Email: {identity.get('email', 'Not specified')}",
+            ]
+
+            if validation_result.get("serial"):
+                cert_lines.append(f"  Certificate Serial: {validation_result['serial']}")
+            if identity.get('fingerprint'):
+                cert_lines.append(f"  Key Fingerprint: {identity['fingerprint']}")
+
+            cert_lines.append("<br><b>Certificate Authority (Signed By):</b>")
+            cert_lines.append(f"  CA Name: {validation_result['signed_by']}")
+            if validation_result.get('issuer_fingerprint'):
+                cert_lines.append(f"  CA Fingerprint: {validation_result['issuer_fingerprint']}")
+            cert_lines.append(f"  Status: {validation_result['certificate_status']}")
+            if validation_result.get('valid_from'):
+                cert_lines.append(f"  Valid From: {validation_result['valid_from']}")
+            cert_lines.append(f"  Expires: {validation_result['expires']}")
+
+            cert_section = QLabel("<br>".join(cert_lines))
+            cert_section.setWordWrap(True)
+            cert_section.setStyleSheet("""
+                background: rgba(34, 211, 238, 0.1);
+                border: 2px solid rgba(34, 211, 238, 0.3);
+                border-radius: 8px;
+                padding: 15px;
+                color: #e2e8f0;
+                font-size: 13px;
+            """)
+            layout.addWidget(cert_section)
+        
+        # File info
+        file_info = QLabel(
+            f"<b>FILE TO TRANSFER:</b><br>"
+            f"  Name: {self.selected_file.name}<br>"
+            f"  Size: {self.selected_file.stat().st_size / (1024*1024):.2f} MB<br>"
+            f"  Path: {self.selected_file.parent}"
+        )
+        file_info.setWordWrap(True)
+        file_info.setStyleSheet("background: rgba(15, 23, 42, 0.6); padding: 15px; border-radius: 8px; font-size: 13px; color: #e2e8f0;")
+        layout.addWidget(file_info)
+        
+        # Confirmation message
+        confirm_msg = QLabel(
+            "The receiver will see the above identity information.\n"
+            "Do you confirm this information is correct and wish to proceed?"
+        )
+        confirm_msg.setWordWrap(True)
+        confirm_msg.setStyleSheet("color: #94a3b8; font-size: 12px; margin-top: 10px;")
+        layout.addWidget(confirm_msg)
+        
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No
+        )
+        button_box.button(QDialogButtonBox.StandardButton.Yes).setText("Confirm & Proceed")
+        button_box.button(QDialogButtonBox.StandardButton.No).setText("Cancel Transfer")
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        button_box.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #22d3ee, stop:1 #0ea5e9);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 10px 20px;
+                min-height: 35px;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #06b6d4, stop:1 #0284c7);
+            }
+        """)
+        layout.addWidget(button_box)
+        
+        # Apply dark theme
+        dialog.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1e293b, stop:1 #0f172a);
+                color: #e2e8f0;
+            }
+        """)
+        
+        return dialog.exec() == QDialog.DialogCode.Accepted
+    
+    def _load_certificate(self) -> Optional[dict]:
+        """Load sender certificate if available."""
+        try:
+            from airseal_common.certificates import Certificate
+
+            username = getattr(self.logged_in_user, "username", None)
+
+            search_paths: list[Path] = []
+            program_data_root = Path("C:/ProgramData/AirSeal/certificates")
+            test_root = Path(__file__).parent.parent.parent / "test_certificates"
+
+            if username:
+                search_paths.append(program_data_root / f"{username}_certificate.json")
+            search_paths.append(program_data_root / "sender_certificate.json")
+
+            if username:
+                search_paths.append(test_root / username / f"{username}_certificate.json")
+            search_paths.append(test_root / "sender_certificate.json")
+
+            checked: set[Path] = set()
+            for path in search_paths:
+                if path in checked:
+                    continue
+                checked.add(path)
+                if not path.exists():
+                    continue
+
+                cert = Certificate.load(path)
+                self.certificate_path = path
+
+                if isinstance(cert.subject, dict):
+                    operator_name = cert.subject.get('operator_name', 'Unknown')
+                    station_id = cert.subject.get('station_id', 'Unknown')
+                else:
+                    operator_name = getattr(cert.subject, 'operator_name', 'Unknown')
+                    station_id = getattr(cert.subject, 'station_id', 'Unknown')
+
+                print(f"[OK] Loaded certificate: {operator_name} ({station_id}) [source: {path.name}]")
+
+                if cert.public_key_fingerprint and cert.public_key_fingerprint != self.sender_fingerprint:
+                    print("WARNING: Certificate public key does not match loaded sender key fingerprint. "
+                          "Ensure the correct private key is available for this operator.")
+
+                return cert.to_dict()
+
+            self.certificate_path = None
+            print("[INFO] No certificate found - manifest will use fingerprint only")
+            return None
+
+        except Exception as e:
+            self.certificate_path = None
+            print(f"WARNING: Could not load certificate: {e}")
+            return None
+    
     def _reset_session(self) -> None:
         self.selected_file = None
         self.manifest = None

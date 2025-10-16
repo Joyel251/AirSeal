@@ -91,10 +91,17 @@ class Manifest:
     # Signature (added after signing)
     signature: Optional[str] = None
     
+    # Certificate (optional, for identity verification)
+    sender_certificate: Optional[Dict[str, Any]] = None
+    
+    # User info (logged-in user who created manifest)
+    user_info: Optional[Dict[str, Any]] = None
+    
     def to_canonical_dict(self) -> Dict[str, Any]:
         """
         Convert to canonical dictionary for signing.
         Fields are sorted alphabetically.
+        Note: sender_certificate is excluded from signing (it will be added after)
         """
         data = {
             "filename": self.filename,
@@ -361,15 +368,19 @@ class ManifestVerifier:
             return False, "Invalid signature"
         
         # 4. Check timestamp (with tolerance for clock drift)
-        manifest_time = datetime.fromtimestamp(manifest.timestamp)
-        now = datetime.now()
-        age = now - manifest_time
-        
-        if age.total_seconds() > (MAX_MANIFEST_AGE_HOURS * 3600):
-            return False, f"Manifest is too old ({age.total_seconds() / 3600:.1f} hours)"
-        
+        try:
+            manifest_timestamp = float(manifest.timestamp)
+        except (TypeError, ValueError):
+            return False, "Manifest contains an invalid timestamp"
+
+        now_seconds = time.time()
+        age_seconds = now_seconds - manifest_timestamp
+
+        if age_seconds > (MAX_MANIFEST_AGE_HOURS * 3600):
+            return False, f"Manifest is too old ({age_seconds / 3600:.1f} hours)"
+
         # Allow some future time for clock drift
-        if manifest_time > now + timedelta(minutes=MANIFEST_TIME_TOLERANCE_MINUTES):
+        if age_seconds < -(MANIFEST_TIME_TOLERANCE_MINUTES * 60):
             return False, "Manifest timestamp is too far in the future"
         
         # 5. Validate nonce (anti-replay)

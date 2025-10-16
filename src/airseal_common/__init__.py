@@ -42,6 +42,12 @@ from .qr import (
     decompress_manifest_from_qr,
 )
 
+from .user_management import (
+    User,
+    UserDatabase,
+    get_user_database,
+)
+
 __all__ = [
     # Crypto
     "KeyPair",
@@ -77,4 +83,8 @@ __all__ = [
     "estimate_qr_size",
     "compress_manifest_for_qr",
     "decompress_manifest_from_qr",
+    # User Management
+    "User",
+    "UserDatabase",
+    "get_user_database",
 ]

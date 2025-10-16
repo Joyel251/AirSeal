@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import sys
+import os
 import time
 import json
+import datetime
+import hashlib
 from pathlib import Path
 from typing import Optional
 from dataclasses import asdict
@@ -50,6 +53,7 @@ from airseal_common import (
     compute_file_hash,
 )
 from airseal_common.scanner import ScannerFactory
+from cryptography.hazmat.primitives import serialization
 
 
 def _find_logo_path() -> Optional[Path]:
@@ -149,7 +153,7 @@ class CameraScanDialog(QDialog):
         layout.addWidget(self.preview_label)
         
         # Status label
-        self.status_label = QLabel("Scanning... Point camera at QR code")
+        self.status_label = QLabel("Scanning... hold the QR anywhere in view")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setStyleSheet("color: #cbd5e1; font-size: 13px; padding: 8px;")
         layout.addWidget(self.status_label)
@@ -192,19 +196,19 @@ class CameraScanDialog(QDialog):
             if not self.cap.isOpened():
                 raise Exception("Could not open camera")
             self.camera_active = True
-            self.status_label.setText("✓ Camera active - scanning for QR codes...")
+            self.status_label.setText("[OK] Camera active - the code will be detected anywhere in the frame")
         except Exception as e:
-            self.status_label.setText(f"✗ Camera error: {str(e)}")
+            self.status_label.setText(f"[ERROR] Camera error: {str(e)}")
             self.status_label.setStyleSheet("color: #ef4444; font-size: 13px; padding: 8px;")
             self.timer.stop()
     
     def _scan_frame(self):
-        """Capture and scan a frame with enhanced tolerance for low-quality webcams."""
+        """Capture and scan a frame using pyzbar QR reader library."""
         if not self.camera_active:
             return
 
         try:
-            from pyzbar.pyzbar import decode as pyzbar_decode
+            from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
             import numpy as np
 
             ret, frame = self.cap.read()
@@ -213,31 +217,57 @@ class CameraScanDialog(QDialog):
 
             display_frame = frame.copy()
 
-            gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
-            denoised = self.cv2.bilateralFilter(gray, 7, 75, 75)
-            clahe = self.cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-            enhanced = clahe.apply(denoised)
-
-            decoded_text = None
+            decoded_text: Optional[str] = None
             polygon_points: Optional[list[tuple[int, int]]] = None
 
-            decoded_objects = pyzbar_decode(enhanced) or pyzbar_decode(gray)
+            # PRIMARY METHOD: Pyzbar QR reader library (dedicated QR/barcode scanner)
+            # Try on original color frame first (pyzbar handles color internally)
+            decoded_objects = pyzbar_decode(frame, symbols=[ZBarSymbol.QRCODE])
+            
             if decoded_objects:
                 obj = decoded_objects[0]
-                decoded_text = obj.data.decode("utf-8")
+                decoded_text = obj.data.decode("utf-8", errors="ignore")
                 if obj.polygon:
                     polygon_points = [(int(p.x), int(p.y)) for p in obj.polygon]
-            else:
-                if self._qr_detector is None:
-                    self._qr_detector = self.cv2.QRCodeDetector()
+            
+            # FALLBACK 1: Pyzbar on grayscale (if color scan didn't work)
+            if decoded_text is None:
+                gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
+                decoded_objects = pyzbar_decode(gray, symbols=[ZBarSymbol.QRCODE])
+                if decoded_objects:
+                    obj = decoded_objects[0]
+                    decoded_text = obj.data.decode("utf-8", errors="ignore")
+                    if obj.polygon:
+                        polygon_points = [(int(p.x), int(p.y)) for p in obj.polygon]
 
-                data, points, _ = self._qr_detector.detectAndDecode(enhanced)
-                if data:
-                    decoded_text = data
-                    if points is not None and points.size:
-                        reshaped = points.reshape(-1, 2)
-                        polygon_points = [(int(pt[0]), int(pt[1])) for pt in reshaped]
+            # FALLBACK 2: Pyzbar with enhanced contrast (for low-light conditions)
+            if decoded_text is None:
+                gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
+                # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+                clahe = self.cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                enhanced = clahe.apply(gray)
+                decoded_objects = pyzbar_decode(enhanced, symbols=[ZBarSymbol.QRCODE])
+                if decoded_objects:
+                    obj = decoded_objects[0]
+                    decoded_text = obj.data.decode("utf-8", errors="ignore")
+                    if obj.polygon:
+                        polygon_points = [(int(p.x), int(p.y)) for p in obj.polygon]
 
+            # FALLBACK 3: Pyzbar with adaptive thresholding (for varied lighting)
+            if decoded_text is None:
+                gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
+                adaptive = self.cv2.adaptiveThreshold(
+                    gray, 255, self.cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                    self.cv2.THRESH_BINARY, 11, 2
+                )
+                decoded_objects = pyzbar_decode(adaptive, symbols=[ZBarSymbol.QRCODE])
+                if decoded_objects:
+                    obj = decoded_objects[0]
+                    decoded_text = obj.data.decode("utf-8", errors="ignore")
+                    if obj.polygon:
+                        polygon_points = [(int(p.x), int(p.y)) for p in obj.polygon]
+
+            # Draw detection box if QR found
             if polygon_points:
                 pts = np.array(polygon_points, dtype=np.int32)
                 self.cv2.polylines(display_frame, [pts], True, (0, 255, 0), 3)
@@ -248,7 +278,7 @@ class CameraScanDialog(QDialog):
                 self.qr_data = decoded_text
                 self.cv2.putText(
                     display_frame,
-                    "QR code locked",
+                    "QR code detected by pyzbar",
                     (20, 40),
                     self.cv2.FONT_HERSHEY_SIMPLEX,
                     1.0,
@@ -269,64 +299,14 @@ class CameraScanDialog(QDialog):
                 )
                 self.preview_label.setPixmap(scaled_pixmap)
 
-                self.status_label.setText("✓ QR code detected!")
+                self.status_label.setText("[OK] QR code detected with pyzbar reader")
                 self.status_label.setStyleSheet("color: #22d3ee; font-size: 14px; font-weight: bold; padding: 8px;")
 
                 self.timer.stop()
                 QTimer.singleShot(350, self.accept)
                 return
 
-            h, w, _ = display_frame.shape
-            guide_margin = int(min(h, w) * 0.18)
-            self.cv2.rectangle(
-                display_frame,
-                (guide_margin, guide_margin),
-                (w - guide_margin, h - guide_margin),
-                (34, 211, 238),
-                2,
-            )
-
-            sweep_min = guide_margin + 12
-            sweep_max = h - guide_margin - 12
-            if sweep_max <= sweep_min:
-                sweep_min = guide_margin
-                sweep_max = h - guide_margin - 1
-            span = max(sweep_max - sweep_min, 1)
-            step = max(int(span * 0.05), 2)
-            self._scan_phase += self._scan_direction * step
-            if self._scan_phase >= span:
-                self._scan_phase = span
-                self._scan_direction = -1
-            elif self._scan_phase <= 0:
-                self._scan_phase = 0
-                self._scan_direction = 1
-            sweep_y = int(sweep_min + self._scan_phase)
-            self.cv2.line(
-                display_frame,
-                (guide_margin + 6, sweep_y),
-                (w - guide_margin - 6, sweep_y),
-                (14, 165, 233),
-                2,
-            )
-            self.cv2.line(
-                display_frame,
-                (guide_margin + 6, sweep_y + 3),
-                (w - guide_margin - 6, sweep_y + 3),
-                (34, 211, 238),
-                1,
-            )
-
-            self.cv2.putText(
-                display_frame,
-                "Align QR inside the blue guide",
-                (20, h - 40),
-                self.cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (148, 163, 184),
-                2,
-                self.cv2.LINE_AA,
-            )
-            self.status_label.setText("Scanning… hold steady for instant lock")
+            self.status_label.setText("Scanning...")
             self.status_label.setStyleSheet("color: #cbd5e1; font-size: 13px; padding: 8px;")
 
             frame_rgb = self.cv2.cvtColor(display_frame, self.cv2.COLOR_BGR2RGB)
@@ -434,7 +414,7 @@ class ManifestScanner(QThread):
                 if not qr_data:
                     raise ValueError("No QR code found in image")
                 
-                self.progress.emit("✓ QR code decoded")
+                self.progress.emit("[OK] QR code decoded")
                 
                 # Parse manifest
                 manifest_qr = ManifestQRData.from_json(qr_data)
@@ -443,7 +423,7 @@ class ManifestScanner(QThread):
                 # Convert to Manifest object
                 manifest = Manifest(**manifest_dict)
                 
-                self.progress.emit("✓ Manifest parsed")
+                self.progress.emit("[OK] Manifest parsed")
             
             # Verify signature and nonce
             self.progress.emit("Verifying signature...")
@@ -452,7 +432,7 @@ class ManifestScanner(QThread):
             if not success:
                 raise ValueError(f"Signature verification failed: {error}")
             
-            self.progress.emit("✓ Signature valid")
+            self.progress.emit("[OK] Signature valid")
             
             # Check policy
             self.progress.emit("Checking policy...")
@@ -466,7 +446,7 @@ class ManifestScanner(QThread):
             if not complies:
                 raise ValueError(f"Policy violation: {reason}")
             
-            self.progress.emit("✓ Policy check passed")
+            self.progress.emit("[OK] Policy check passed")
             
             # Success
             self.finished.emit({
@@ -476,7 +456,7 @@ class ManifestScanner(QThread):
             })
             
         except Exception as e:
-            self.progress.emit(f"✗ Error: {str(e)}")
+            self.progress.emit(f"[ERROR] {str(e)}")
             self.finished.emit({
                 "success": False,
                 "manifest": {},
@@ -516,7 +496,7 @@ class FileVerifier(QThread):
             # Compute file hash
             self.progress.emit("Computing file hash...")
             actual_hash = compute_file_hash(self.file_path)
-            self.progress.emit(f"✓ Hash: {actual_hash[:16]}...")
+            self.progress.emit(f"[OK] Hash: {actual_hash[:16]}...")
             
             # Compare with manifest
             self.progress.emit("Comparing with manifest...")
@@ -527,7 +507,7 @@ class FileVerifier(QThread):
                     f"Hash mismatch!\nExpected: {expected_hash[:16]}...\nActual: {actual_hash[:16]}..."
                 )
             
-            self.progress.emit("✓ Hash matches manifest")
+            self.progress.emit("[OK] Hash matches manifest")
 
             # Run antivirus scan using Windows Defender when available.
             self.progress.emit("Running antivirus scan (Windows Defender preferred)...")
@@ -545,7 +525,7 @@ class FileVerifier(QThread):
                 raise ValueError(f"Antivirus detected threats: {threat_list}")
             if status == "ERROR":
                 raise ValueError(f"Antivirus scan failed: {scan_result.details}")
-            self.progress.emit(f"✓ Antivirus scan complete ({scan_result.engine})")
+            self.progress.emit(f"[OK] Antivirus scan complete ({scan_result.engine})")
 
             # Check policy on actual file
             self.progress.emit("Checking file policy...")
@@ -556,7 +536,7 @@ class FileVerifier(QThread):
                 if not safe:
                     raise ValueError(f"File policy check failed: {reason}")
             
-            self.progress.emit("✓ File passes policy checks")
+            self.progress.emit("[OK] File passes policy checks")
             
             # Generate receipt
             self.progress.emit("Generating import receipt...")
@@ -574,7 +554,7 @@ class FileVerifier(QThread):
             signed_receipt = receipt_signer.sign_receipt(receipt)
             receipt_path = receipt_signer.save_receipt(signed_receipt)
             
-            self.progress.emit(f"✓ Receipt saved: {receipt_path.name}")
+            self.progress.emit(f"[OK] Receipt saved: {receipt_path.name}")
             
             # Success
             result_msg = (
@@ -591,13 +571,82 @@ class FileVerifier(QThread):
                 "error": None,
                 "scan_engine": scan_result.engine,
                 "scan_status": scan_result.status,
+                "source_file": str(self.file_path),
+                "file_hash": actual_hash,
+                "receipt_path": str(receipt_path),
             })
             
         except Exception as e:
-            self.progress.emit(f"✗ Error: {str(e)}")
+            self.progress.emit(f"[ERROR] {str(e)}")
             self.finished.emit({
                 "success": False,
                 "result": "",
+                "error": str(e),
+            })
+
+
+class SecureFileSaver(QThread):
+    """Background worker to securely save and verify file."""
+    
+    progress = Signal(str)
+    finished = Signal(dict)  # {success: bool, saved_path: str, error: str}
+    
+    def __init__(self, source_file: Path, save_path: Path, expected_hash: str):
+        super().__init__()
+        self.source_file = source_file
+        self.save_path = save_path
+        self.expected_hash = expected_hash
+    
+    def run(self):
+        """Copy file securely and verify integrity."""
+        try:
+            import shutil
+            
+            # Ensure parent directory exists
+            self.progress.emit(f"Creating directory: {self.save_path.parent}...")
+            self.save_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Copy file in chunks with integrity preservation
+            self.progress.emit(f"Copying file to: {self.save_path.name}...")
+            with open(self.source_file, 'rb') as src, open(self.save_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst, length=1024*1024)  # 1MB chunks
+            
+            # Set secure file permissions (read-only)
+            self.progress.emit("Setting secure file permissions...")
+            if hasattr(os, 'chmod'):
+                import stat
+                os.chmod(self.save_path, stat.S_IRUSR | stat.S_IRGRP)  # Read-only
+            
+            # Verify hash of copied file
+            self.progress.emit("Verifying copied file integrity...")
+            actual_hash = compute_file_hash(self.save_path)
+            
+            if actual_hash != self.expected_hash:
+                # Hash mismatch - delete corrupted file
+                self.save_path.unlink()
+                raise ValueError(
+                    f"File copy verification failed!\n\n"
+                    f"Expected: {self.expected_hash[:32]}...\n"
+                    f"Actual: {actual_hash[:32]}...\n\n"
+                    f"The file may have been corrupted during copy and has been deleted for safety."
+                )
+            
+            self.progress.emit("[OK] File integrity verified")
+            
+            # Success
+            self.finished.emit({
+                "success": True,
+                "saved_path": str(self.save_path),
+                "file_hash": actual_hash,
+                "error": None,
+            })
+            
+        except Exception as e:
+            self.progress.emit(f"[ERROR] {str(e)}")
+            self.finished.emit({
+                "success": False,
+                "saved_path": "",
+                "file_hash": "",
                 "error": str(e),
             })
 
@@ -614,26 +663,26 @@ class ReceiverMainWindow(QMainWindow):
             self.setWindowIcon(app_icon)
         
         # Initialize backend components using shared keys for testing
-        from shared_keys import get_or_create_receiver_key, get_or_create_sender_key
-        
+        from shared_keys import get_or_create_receiver_key
+
         self.receiver_key = get_or_create_receiver_key()
         self.receiver_fingerprint = self.receiver_key.get_fingerprint()
         self.trust_store = TrustStore()
         self.nonce_mgr = NonceManager()
         self.policy_store = PolicyStore()
         
-        # For testing: Add sender's public key to trust store
-        # In production, this would be done through secure key exchange
-        sender_key = get_or_create_sender_key()
-        self.trust_store.add_key(
-            key_id=sender_key.get_fingerprint(),
-            public_key=sender_key.public_key
-        )
-        print(f"✓ Receiver trusts sender: {sender_key.get_fingerprint()[:16]}...")
+        # Load CA certificate for certificate verification
+        self.ca_certificate = self._load_ca_certificate()
+        self.certificate_verifier = None
+        if self.ca_certificate:
+            from airseal_common.certificates import CertificateVerifier
+            self.certificate_verifier = CertificateVerifier(self.ca_certificate)
+            print(f"[OK] Loaded CA certificate: {self.ca_certificate.get('subject', {}).get('operator_name', 'Unknown')}")
         
         # State
         self.manifest: Optional[dict] = None
         self._manifest_verified_at: Optional[float] = None
+        self._verified_file_info: Optional[dict] = None  # Store verified file info for secure save
         
         self._build_ui()
     
@@ -747,7 +796,6 @@ class ReceiverMainWindow(QMainWindow):
         self.scan_camera_btn.setEnabled(True)  # Ready to scan immediately
         self.scan_camera_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_camera_btn.setStyleSheet(self._primary_button_style())
-        self.scan_camera_btn.setIcon(self.style().standardIcon(QStyle.SP_DesktopIcon))
         self.scan_camera_btn.clicked.connect(self._scan_with_camera)
         btn_row.addWidget(self.scan_camera_btn)
 
@@ -755,7 +803,6 @@ class ReceiverMainWindow(QMainWindow):
         self.scan_file_btn.setEnabled(True)  # Ready to scan immediately
         self.scan_file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_file_btn.setStyleSheet(self._primary_button_style())
-        self.scan_file_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         self.scan_file_btn.clicked.connect(self._scan_from_file)
         btn_row.addWidget(self.scan_file_btn)
 
@@ -782,13 +829,24 @@ class ReceiverMainWindow(QMainWindow):
         """Initialize file verification card."""
         layout = self.verify_card.layout()
 
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+        
         self.select_file_btn = QPushButton("Select File to Verify")
         self.select_file_btn.setEnabled(False)
         self.select_file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.select_file_btn.setStyleSheet(self._primary_button_style())
-        self.select_file_btn.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
         self.select_file_btn.clicked.connect(self._select_file_to_verify)
-        layout.addWidget(self.select_file_btn)
+        btn_row.addWidget(self.select_file_btn)
+        
+        self.save_file_btn = QPushButton("Save Verified File")
+        self.save_file_btn.setEnabled(False)
+        self.save_file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_file_btn.setStyleSheet(self._secondary_button_style())
+        self.save_file_btn.clicked.connect(self._save_verified_file_securely)
+        btn_row.addWidget(self.save_file_btn)
+        
+        layout.addLayout(btn_row)
 
         self.verify_progress = QProgressBar()
         self.verify_progress.setVisible(False)
@@ -854,6 +912,28 @@ class ReceiverMainWindow(QMainWindow):
         )
         layout.addWidget(self.result_label)
 
+    def _load_ca_certificate(self) -> Optional[dict]:
+        """Load CA certificate for certificate verification."""
+        try:
+            # Try to load from standard location
+            ca_cert_path = Path("C:/ProgramData/AirSeal/certificates/ca_certificate.json")
+            
+            if not ca_cert_path.exists():
+                # Try local test location
+                ca_cert_path = Path(__file__).parent.parent.parent / "test_certificates" / "ca_certificate.json"
+            
+            if ca_cert_path.exists():
+                ca_cert_data = json.loads(ca_cert_path.read_text())
+                print(f"[OK] Loaded CA certificate from: {ca_cert_path}")
+                return ca_cert_data
+            else:
+                print("[INFO] No CA certificate found - certificate verification disabled")
+                return None
+                
+        except Exception as e:
+            print(f"WARNING: Could not load CA certificate: {e}")
+            return None
+    
     def _primary_button_style(self) -> str:
         """Return primary button stylesheet."""
         return """
@@ -955,31 +1035,71 @@ class ReceiverMainWindow(QMainWindow):
             # Convert to Manifest object
             manifest = Manifest(**manifest_dict)
             
-            self._append_and_scroll(self.manifest_status, "✓ Manifest parsed successfully")
+            self._append_and_scroll(self.manifest_status, "[OK] Manifest parsed successfully")
             
+            sender_identity = None
+            cert_obj = None
+
+            if manifest.sender_certificate:
+                self._append_and_scroll(self.manifest_status, "[INFO] Verifying sender certificate...")
+                if not self.certificate_verifier:
+                    raise ValueError(
+                        "Certificate presented but receiver has no trusted Certificate Authority metadata."
+                    )
+
+                from airseal_common.certificates import Certificate
+
+                cert_obj = Certificate.from_dict(manifest.sender_certificate)
+                is_valid, error_msg = self.certificate_verifier.verify_certificate(cert_obj)
+                if not is_valid:
+                    raise ValueError(f"Certificate verification failed: {error_msg}")
+
+                if cert_obj.public_key_fingerprint and manifest.signer_id != cert_obj.public_key_fingerprint:
+                    raise ValueError(
+                        "Manifest signer fingerprint does not match the certificate's public key fingerprint."
+                    )
+
+                if not cert_obj.public_key_pem:
+                    raise ValueError("Certificate is missing the public key information required for verification.")
+
+                public_key = serialization.load_pem_public_key(cert_obj.public_key_pem.encode("utf-8"))
+                if not self.trust_store.has_key(manifest.signer_id):
+                    self.trust_store.add_key(manifest.signer_id, public_key)
+                    self._append_and_scroll(
+                        self.manifest_status,
+                        f"[INFO] Trusted signer key derived from certificate {manifest.signer_id[:16]}...",
+                    )
+
+                sender_identity = self.certificate_verifier.extract_identity(cert_obj)
+                self._append_and_scroll(self.manifest_status, "[OK] Certificate verified against trusted CA")
+
             # Verify signature
             self._append_and_scroll(self.manifest_status, "[INFO] Verifying digital signature...")
             verifier = ManifestVerifier(self.trust_store, self.nonce_mgr)
             success, error = verifier.verify_manifest(manifest, check_nonce=False)
-            
+
             if not success:
                 raise ValueError(f"Signature verification failed: {error}")
-            
-            self._append_and_scroll(self.manifest_status, "✓ Signature verified")
-            
+
+            self._append_and_scroll(self.manifest_status, "[OK] Signature verified")
+
             # Check policy
             self._append_and_scroll(self.manifest_status, "[INFO] Checking security policy...")
             engine = self.policy_store.get_engine(manifest.policy_id)
-            
+
             if not engine:
                 raise ValueError(f"Unknown policy: {manifest.policy_id}")
-            
+
             complies, reason = engine.check_manifest(manifest)
-            
+
             if not complies:
                 raise ValueError(f"Policy violation: {reason}")
-            
-            self._append_and_scroll(self.manifest_status, "✓ Policy check passed")
+
+            self._append_and_scroll(self.manifest_status, "[OK] Policy check passed")
+
+            if manifest.sender_certificate and not sender_identity:
+                # Certificate was present but we could not verify it above; block transfer
+                raise ValueError("Sender certificate could not be verified. Transfer rejected.")
             
             # Success - store manifest and enable file verification
             self.manifest = asdict(manifest)
@@ -990,19 +1110,94 @@ class ReceiverMainWindow(QMainWindow):
             self._append_and_scroll(self.manifest_status, f"  Expected SHA-256: {self.manifest['sha256'][:16]}...")
             self._append_and_scroll(self.manifest_status, f"  Scan Result: {self.manifest['scan_status']}")
             self._append_and_scroll(self.manifest_status, f"  Policy: {self.manifest['policy_id']}")
-            self._append_and_scroll(self.manifest_status, f"  Signer: {self.manifest.get('signer_id', 'Unknown')[:16]}...")
+            
+            # Display verified identity with certificate details
+            if sender_identity and manifest.sender_certificate:
+                from airseal_common.certificates import Certificate
+                cert = cert_obj or Certificate.from_dict(manifest.sender_certificate)
+
+                self._append_and_scroll(self.manifest_status, "\n" + "="*60)
+                self._append_and_scroll(self.manifest_status, "[CERTIFICATE VERIFIED] CRYPTOGRAPHICALLY VERIFIED IDENTITY")
+                self._append_and_scroll(self.manifest_status, "="*60)
+
+                # Certificate holder (operator)
+                self._append_and_scroll(self.manifest_status, "\nCERTIFICATE HOLDER:")
+                self._append_and_scroll(self.manifest_status, f"  Name: {sender_identity.get('operator_name', 'Unknown')}")
+                self._append_and_scroll(self.manifest_status, f"  Organization: {sender_identity.get('organization', 'Unknown')}")
+                self._append_and_scroll(self.manifest_status, f"  Station ID: {sender_identity.get('station_id', 'Unknown')}")
+                if sender_identity.get('department'):
+                    self._append_and_scroll(self.manifest_status, f"  Department: {sender_identity['department']}")
+                if sender_identity.get('email'):
+                    self._append_and_scroll(self.manifest_status, f"  Email: {sender_identity['email']}")
+                
+                # Certificate issuer (CA)
+                self._append_and_scroll(self.manifest_status, "\nCERTIFICATE ISSUED BY (Authority):")
+                # Handle both old format (issuer_name) and new format (issuer dict)
+                if cert.issuer:
+                    self._append_and_scroll(self.manifest_status, f"  CA Name: {cert.issuer.get('common_name', 'Unknown CA')}")
+                    if cert.issuer.get('organization'):
+                        self._append_and_scroll(self.manifest_status, f"  CA Organization: {cert.issuer['organization']}")
+                elif cert.issuer_name:
+                    self._append_and_scroll(self.manifest_status, f"  CA Name: {cert.issuer_name}")
+                
+                # Certificate validity
+                self._append_and_scroll(self.manifest_status, "\nCERTIFICATE VALIDITY:")
+                from datetime import datetime
+                # Handle both old format (not_before/not_after) and new format (valid_from/valid_until)
+                if cert.valid_from and cert.valid_until:
+                    valid_from = datetime.fromisoformat(cert.valid_from.replace('Z', '+00:00'))
+                    valid_until = datetime.fromisoformat(cert.valid_until.replace('Z', '+00:00'))
+                elif cert.not_before and cert.not_after:
+                    valid_from = datetime.fromtimestamp(cert.not_before)
+                    valid_until = datetime.fromtimestamp(cert.not_after)
+                else:
+                    valid_from = datetime.now()
+                    valid_until = datetime.now()
+                
+                self._append_and_scroll(self.manifest_status, f"  Valid From: {valid_from.strftime('%Y-%m-%d %H:%M:%S')}")
+                self._append_and_scroll(self.manifest_status, f"  Valid Until: {valid_until.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Certificate fingerprint
+                import hashlib
+                import json
+                cert_bytes = json.dumps(cert.to_dict(), sort_keys=True).encode()
+                cert_fingerprint = hashlib.sha256(cert_bytes).hexdigest()
+                self._append_and_scroll(self.manifest_status, f"  Fingerprint: {cert_fingerprint[:32]}...")
+            
+            # Display logged-in user info from manifest
+            if self.manifest.get('user_info'):
+                user_info = self.manifest['user_info']
+                self._append_and_scroll(self.manifest_status, "\n" + "-"*60)
+                self._append_and_scroll(self.manifest_status, "[SESSION INFO] USER WHO SENT THIS TRANSFER")
+                self._append_and_scroll(self.manifest_status, "-"*60)
+                self._append_and_scroll(self.manifest_status, f"\n  Full Name: {user_info.get('full_name', 'Unknown')}")
+                self._append_and_scroll(self.manifest_status, f"  Username: {user_info.get('username', 'Unknown')}")
+                self._append_and_scroll(self.manifest_status, f"  Role: {user_info.get('role', 'Unknown').upper()}")
+                if user_info.get('station_id'):
+                    self._append_and_scroll(self.manifest_status, f"  Station: {user_info['station_id']}")
+                if user_info.get('organization'):
+                    self._append_and_scroll(self.manifest_status, f"  Organization: {user_info['organization']}")
+                if user_info.get('department'):
+                    self._append_and_scroll(self.manifest_status, f"  Department: {user_info['department']}")
+                
+                # Timestamp
+                import datetime
+                timestamp = datetime.datetime.fromtimestamp(self.manifest.get('timestamp', 0))
+                self._append_and_scroll(self.manifest_status, f"  Transfer Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # Fallback if no identity info available
+            if not sender_identity and not self.manifest.get('user_info'):
+                self._append_and_scroll(self.manifest_status, "\n[WARNING] No identity information available")
+                self._append_and_scroll(self.manifest_status, f"  Signer Key ID: {self.manifest.get('signer_id', 'Unknown')[:32]}...")
+                self._append_and_scroll(self.manifest_status, "  (Consider requiring certificates for all transfers)")
             
             # Enable file verification
             self.select_file_btn.setEnabled(True)
-            self._prompt_for_media_connection()
             
-            QMessageBox.information(
-                self,
-                "QR Code Scanned Successfully",
-                f"Manifest verified!\n\nFile: {self.manifest['filename']}\n"
-                f"Size: {self.manifest['size']} bytes\n\n"
-                "Connect the trusted USB/CD now, then choose 'Select File to Verify'."
-            )
+            # Show comprehensive security summary
+            self._show_security_summary(manifest, sender_identity)
+            
+            self._prompt_for_media_connection()
             
         except Exception as e:
             error_msg = f"Failed to process QR code: {str(e)}"
@@ -1164,12 +1359,29 @@ class ReceiverMainWindow(QMainWindow):
                 }
                 """
             )
+            
+            # Store verified file info for secure save
+            self._verified_file_info = result
+            
+            # Enable save button
+            self.save_file_btn.setEnabled(True)
+            
+            # Prompt user to save file securely
             engine = result.get("scan_engine", "Antivirus")
-            QMessageBox.information(
+            reply = QMessageBox.question(
                 self,
-                "Success",
-                f"File verified and imported successfully!\n\nAntivirus engine: {engine}"
+                "File Verified Successfully",
+                f"File verified and imported successfully!\n\n"
+                f"Antivirus engine: {engine}\n"
+                f"Hash: {result.get('file_hash', 'N/A')[:32]}...\n\n"
+                f"Would you like to save this file securely to your local system now?\n"
+                f"(You can also use the 'Save Verified File' button later)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
             )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self._save_verified_file_securely()
         else:
             self._append_and_scroll(self.verify_status, f"\n[ERROR] {result['error']}")
             self.result_label.setText("VERIFICATION FAILED\n\n" + result['error'])
@@ -1201,6 +1413,372 @@ class ReceiverMainWindow(QMainWindow):
     def _on_verify_progress(self, msg: str) -> None:
         self._append_and_scroll(self.verify_status, f"- {msg}")
 
+    def _save_verified_file_securely(self):
+        """Save verified file securely to local system with integrity checks."""
+        if not self._verified_file_info:
+            QMessageBox.warning(
+                self,
+                "No Verified File",
+                "Please verify a file first before attempting to save it."
+            )
+            return
+        
+        try:
+            source_file = Path(self._verified_file_info["source_file"])
+            expected_hash = self._verified_file_info["file_hash"]
+            filename = self.manifest["filename"]
+            
+            # Check if source file still exists
+            if not source_file.exists():
+                QMessageBox.critical(
+                    self,
+                    "Source File Not Found",
+                    f"The verified file is no longer accessible at:\n{source_file}\n\n"
+                    "Please reconnect the removable media and verify the file again."
+                )
+                return
+            
+            # Ask user where to save the file
+            default_save_path = Path.home() / "Documents" / "AirSeal_Imports" / filename
+            default_save_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            save_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Verified File Securely",
+                str(default_save_path),
+                "All Files (*.*)",
+            )
+            
+            if not save_path:
+                return  # User cancelled
+            
+            save_path = Path(save_path)
+            
+            # Prevent overwriting without confirmation
+            if save_path.exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Overwrite File?",
+                    f"The file '{save_path.name}' already exists.\n\n"
+                    "Do you want to overwrite it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            
+            # Disable save button during operation
+            self.save_file_btn.setEnabled(False)
+            
+            # Show progress in verify status box
+            self._append_and_scroll(self.verify_status, "\n[INFO] Starting secure file save...")
+            self.verify_progress.setVisible(True)
+            self.verify_progress.setRange(0, 0)  # Indeterminate progress
+            
+            # Start worker thread for secure save (non-blocking)
+            self.save_worker = SecureFileSaver(source_file, save_path, expected_hash)
+            self.save_worker.progress.connect(self._on_save_progress)
+            self.save_worker.finished.connect(self._on_save_finished)
+            self.save_worker.finished.connect(self.save_worker.deleteLater)
+            self.save_worker.start()
+                
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Secure Save Failed",
+                f"Failed to start secure save:\n\n{str(e)}"
+            )
+            self._append_and_scroll(self.verify_status, f"\n[ERROR] Secure save failed: {str(e)}")
+            self.save_file_btn.setEnabled(True)
+    
+    def _on_save_progress(self, msg: str):
+        """Handle save progress updates."""
+        self._append_and_scroll(self.verify_status, f"- {msg}")
+    
+    def _on_save_finished(self, result: dict):
+        """Handle save completion."""
+        self.verify_progress.setVisible(False)
+        
+        if result["success"]:
+            saved_path = Path(result["saved_path"])
+            file_hash = result["file_hash"]
+            receipt_path = self._verified_file_info.get("receipt_path", "")
+            
+            self._append_and_scroll(
+                self.verify_status,
+                f"\n[OK] File saved securely to: {saved_path}"
+            )
+            self._append_and_scroll(
+                self.verify_status,
+                f"[OK] Hash verified: {file_hash[:32]}..."
+            )
+            self._append_and_scroll(
+                self.verify_status,
+                f"[OK] File permissions: Read-only"
+            )
+            
+            # Re-enable save button for re-saving if needed
+            self.save_file_btn.setEnabled(True)
+            
+            QMessageBox.information(
+                self,
+                "File Saved Successfully",
+                f"File saved securely to:\n{saved_path}\n\n"
+                f"[OK] Integrity verified (SHA-256 match)\n"
+                f"[OK] File permissions set to read-only\n"
+                f"[OK] Import receipt: {Path(receipt_path).name if receipt_path else 'Generated'}\n\n"
+                f"The file is now safely stored on your local system."
+            )
+        else:
+            self._append_and_scroll(
+                self.verify_status,
+                f"\n[ERROR] Save failed: {result['error']}"
+            )
+            QMessageBox.critical(
+                self,
+                "Secure Save Failed",
+                f"Failed to save file securely:\n\n{result['error']}"
+            )
+            self.save_file_btn.setEnabled(True)
+
+    def _show_security_summary(self, manifest: Manifest, sender_identity: Optional[dict]) -> None:
+        """Show comprehensive security summary with certificate chain of trust."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QScrollArea, QWidget
+        from PySide6.QtGui import QFont
+        from PySide6.QtCore import Qt
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Transfer Security Summary")
+        dialog.setMinimumSize(700, 600)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Title
+        title = QLabel("TRANSFER SECURITY VERIFICATION")
+        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title.setStyleSheet("color: #22d3ee;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        
+        # Scrollable content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(15)
+        
+        # File information
+        file_box = self._create_info_box(
+            "FILE INFORMATION",
+            f"Filename: {manifest.filename}\n"
+            f"Size: {manifest.size:,} bytes ({manifest.size / (1024*1024):.2f} MB)\n"
+            f"SHA-256: {manifest.sha256[:32]}...\n"
+            f"Scan Status: {manifest.scan_status}\n"
+            f"Scan Engine: {manifest.scan_engine}",
+            "#3b82f6"
+        )
+        content_layout.addWidget(file_box)
+        
+        # Certificate information
+        if sender_identity and manifest.sender_certificate:
+            from airseal_common.certificates import Certificate
+            from datetime import datetime
+            import hashlib
+            import json
+            
+            cert = Certificate.from_dict(manifest.sender_certificate)
+            
+            # Certificate holder
+            holder_info = (
+                f"Operator Name: {sender_identity.get('operator_name', 'Unknown')}\n"
+                f"Organization: {sender_identity.get('organization', 'Unknown')}\n"
+                f"Station ID: {sender_identity.get('station_id', 'Unknown')}\n"
+            )
+            if sender_identity.get('department'):
+                holder_info += f"Department: {sender_identity['department']}\n"
+            if sender_identity.get('email'):
+                holder_info += f"Email: {sender_identity['email']}\n"
+            if cert.serial_number:
+                holder_info += f"Certificate Serial: {cert.serial_number}\n"
+            if cert.public_key_fingerprint:
+                holder_info += f"Key Fingerprint: {cert.public_key_fingerprint}\n"
+            
+            cert_box = self._create_info_box(
+                "[VERIFIED] CERTIFICATE HOLDER",
+                holder_info.strip(),
+                "#10b981"
+            )
+            content_layout.addWidget(cert_box)
+            
+            # Certificate authority - handle both old and new formats
+            ca_info = ""
+            if cert.issuer:
+                ca_info = f"CA Name: {cert.issuer.get('common_name', 'Unknown CA')}\n"
+                if cert.issuer.get('organization'):
+                    ca_info += f"CA Organization: {cert.issuer['organization']}\n"
+                if cert.issuer.get('station_id'):
+                    ca_info += f"CA Station: {cert.issuer['station_id']}\n"
+                issuer_fp = cert.issuer.get('fingerprint') or cert.issuer_fingerprint
+                if issuer_fp:
+                    ca_info += f"CA Fingerprint: {issuer_fp}\n"
+            elif cert.issuer_name:
+                ca_info = f"CA Name: {cert.issuer_name}\n"
+                if cert.issuer_fingerprint:
+                    ca_info += f"CA Fingerprint: {cert.issuer_fingerprint}\n"
+            
+            ca_box = self._create_info_box(
+                "[TRUSTED] CERTIFICATE AUTHORITY (Who Signed)",
+                ca_info.strip(),
+                "#8b5cf6"
+            )
+            content_layout.addWidget(ca_box)
+            
+            # Certificate validity - handle both old and new formats
+            if cert.valid_from and cert.valid_until:
+                valid_from = datetime.fromisoformat(cert.valid_from.replace('Z', '+00:00'))
+                valid_until = datetime.fromisoformat(cert.valid_until.replace('Z', '+00:00'))
+                now = datetime.now(valid_from.tzinfo)
+            elif cert.not_before and cert.not_after:
+                valid_from = datetime.fromtimestamp(cert.not_before)
+                valid_until = datetime.fromtimestamp(cert.not_after)
+                now = datetime.now()
+            else:
+                valid_from = datetime.now()
+                valid_until = datetime.now()
+                now = datetime.now()
+            
+            days_remaining = (valid_until - now).days
+            
+            validity_status = "VALID" if days_remaining > 0 else "EXPIRED"
+            validity_color = "#10b981" if days_remaining > 30 else "#f59e0b" if days_remaining > 0 else "#ef4444"
+            
+            # Certificate fingerprint
+            cert_bytes = json.dumps(cert.to_dict(), sort_keys=True).encode()
+            cert_fingerprint = hashlib.sha256(cert_bytes).hexdigest()
+            
+            validity_info = (
+                f"Status: {validity_status}\n"
+                f"Valid From: {valid_from.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Valid Until: {valid_until.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Days Remaining: {days_remaining}\n"
+                f"Certificate Fingerprint: {cert_fingerprint[:48]}..."
+            )
+            
+            validity_box = self._create_info_box(
+                "CERTIFICATE VALIDITY",
+                validity_info,
+                validity_color
+            )
+            content_layout.addWidget(validity_box)
+        
+        else:
+            # No certificate warning
+            warning_box = self._create_info_box(
+                "[WARNING] NO CERTIFICATE",
+                "This transfer does NOT have a verified certificate.\n"
+                "Sender identity cannot be cryptographically verified.\n"
+                "Only the cryptographic key fingerprint is available.\n\n"
+                f"Key Fingerprint: {manifest.signer_id[:48]}...",
+                "#f59e0b"
+            )
+            content_layout.addWidget(warning_box)
+        
+        # Logged-in user information
+        if manifest.user_info:
+            user_info = manifest.user_info
+            user_text = (
+                f"Full Name: {user_info.get('full_name', 'Unknown')}\n"
+                f"Username: {user_info.get('username', 'Unknown')}\n"
+                f"Role: {user_info.get('role', 'Unknown').upper()}\n"
+            )
+            if user_info.get('station_id'):
+                user_text += f"Station: {user_info['station_id']}\n"
+            if user_info.get('organization'):
+                user_text += f"Organization: {user_info['organization']}\n"
+            if user_info.get('department'):
+                user_text += f"Department: {user_info['department']}\n"
+            
+            # Transfer timestamp
+            from datetime import datetime
+            timestamp = datetime.fromtimestamp(manifest.timestamp)
+            user_text += f"\nTransfer Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+            
+            user_box = self._create_info_box(
+                "[SESSION] USER WHO INITIATED TRANSFER",
+                user_text.strip(),
+                "#06b6d4"
+            )
+            content_layout.addWidget(user_box)
+        
+        # Security checks passed
+        checks_box = self._create_info_box(
+            "[OK] SECURITY CHECKS PASSED",
+            f"- Cryptographic signature verified\n"
+            f"- Manifest integrity confirmed\n"
+            f"- Policy compliance validated\n"
+            f"- Certificate chain verified (if present)\n"
+            f"- File scan result: {manifest.scan_status}",
+            "#10b981"
+        )
+        content_layout.addWidget(checks_box)
+        
+        scroll.setWidget(content_widget)
+        layout.addWidget(scroll)
+        
+        # Close button
+        close_btn = QPushButton("Accept & Continue")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #22d3ee, stop:1 #0ea5e9);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 12px 24px;
+                min-height: 40px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #06b6d4, stop:1 #0284c7);
+            }
+        """)
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        
+        # Apply dark theme
+        dialog.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1e293b, stop:1 #0f172a);
+                color: #e2e8f0;
+            }
+        """)
+        
+        dialog.exec()
+    
+    def _create_info_box(self, title: str, content: str, accent_color: str) -> QLabel:
+        """Create a styled information box."""
+        box = QLabel(f"<b style='color: {accent_color};'>{title}</b><br><br>{content.replace(chr(10), '<br>')}")
+        box.setWordWrap(True)
+        box.setStyleSheet(f"""
+            QLabel {{
+                background: rgba(15, 23, 42, 0.6);
+                border-left: 4px solid {accent_color};
+                border-radius: 8px;
+                padding: 15px;
+                color: #e2e8f0;
+                font-size: 13px;
+                font-family: 'Segoe UI', monospace;
+            }}
+        """)
+        return box
+    
     def _prompt_for_media_connection(self) -> None:
         """Instruct the operator to connect removable media after trust is established."""
         filename = self.manifest["filename"] if self.manifest else "the file"
